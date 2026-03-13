@@ -1,8 +1,12 @@
 import { StatusBar } from 'expo-status-bar';
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { StyleSheet, Text, View, TouchableOpacity, Image, ActivityIndicator } from 'react-native';
+import {
+  StyleSheet, Text, View, TouchableOpacity, Image,
+  ActivityIndicator, Modal, Pressable,
+} from 'react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import * as Location from 'expo-location';
+import { WebView } from 'react-native-webview';
 
 // ─── Change this to your real API endpoint ────────────────────────────────────
 const REPORT_API_URL = 'https://your-server.example.com/api/report';
@@ -27,10 +31,24 @@ async function sendReport(photoUri, coords) {
   if (!res.ok) throw new Error(`Server error: ${res.status}`);
 }
 
+// Build a local HTML page that embeds Google Maps in an iframe (required by the API)
+function buildMapHtml(lat, lng) {
+  const src = `https://maps.google.com/maps?q=${lat},${lng}&z=16&output=embed`;
+  return `<!DOCTYPE html><html><head>
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <style>*{margin:0;padding:0}html,body,iframe{width:100%;height:100%;border:none}</style>
+  </head><body>
+    <iframe src="${src}" width="100%" height="100%" frameborder="0" allowfullscreen></iframe>
+  </body></html>`;
+}
+
 export default function App() {
   const [camPermission, requestCamPermission] = useCameraPermissions();
   const [photo, setPhoto] = useState(null);
   const [location, setLocation] = useState(null);
+
+  // 'camera' | 'map' | 'photo'  – what the main viewport shows
+  const [viewMode, setViewMode] = useState('camera');
 
   // 'ready' | 'capturing' | 'locating' | 'sending' | 'success' | 'error'
   const [status, setStatus] = useState('ready');
@@ -42,23 +60,19 @@ export default function App() {
 
   // Burst-mode tracking
   const [isAutoBurst, setIsAutoBurst] = useState(false);
-  const captureTimestamps = useRef([]);   // timestamps of recent captures
-  const burstIntervalRef = useRef(null);  // setInterval handle
+  const captureTimestamps = useRef([]);
+  const burstIntervalRef = useRef(null);
 
-  // Start fetching location right away — runs in parallel with camera warmup
+  // Pre-fetch location in parallel with camera warmup
   useEffect(() => {
     (async () => {
       try {
         const perm = await Location.requestForegroundPermissionsAsync();
         if (perm.status !== 'granted') return;
-
-        // Try last-known position first (instant)
         const last = await Location.getLastKnownPositionAsync();
         if (last) prefetchedLocRef.current = last.coords;
-
-        // Then get a fresh accurate fix in the background
         const fresh = await Location.getCurrentPositionAsync({
-          accuracy: Location.Accuracy.Balanced, // faster than High
+          accuracy: Location.Accuracy.Balanced,
         });
         prefetchedLocRef.current = fresh.coords;
         setLocation(fresh.coords);
@@ -67,7 +81,6 @@ export default function App() {
       }
     })();
     requestCamPermission();
-    // Cleanup interval on unmount
     return () => { if (burstIntervalRef.current) clearInterval(burstIntervalRef.current); };
   }, []);
 
@@ -75,22 +88,21 @@ export default function App() {
     if (isProcessing.current || !cameraRef.current) return;
     isProcessing.current = true;
 
+    // Switch back to camera for capture
+    setViewMode('camera');
+
     try {
-      // 1. Capture photo instantly (no OK button — in-app camera)
       setStatus('capturing');
-      setStatusMsg('� 正在拍照...');
+      setStatusMsg('📸 正在拍照...');
       const picture = await cameraRef.current.takePictureAsync({ quality: 0.8, skipProcessing: true });
       setPhoto(picture.uri);
 
-      // 2. Get location — use prefetched value if available (no wait!)
       setStatus('locating');
       setStatusMsg('📍 正在获取位置...');
       let coords = prefetchedLocRef.current;
       if (coords) {
-        // Already have a location from prefetch — use it instantly
         setLocation(coords);
       } else {
-        // Fallback: fetch now if prefetch didn't complete yet
         const locPerm = await Location.requestForegroundPermissionsAsync();
         if (locPerm.status !== 'granted') {
           setStatus('error');
@@ -98,14 +110,11 @@ export default function App() {
           isProcessing.current = false;
           return;
         }
-        const loc = await Location.getCurrentPositionAsync({
-          accuracy: Location.Accuracy.Balanced,
-        });
+        const loc = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
         coords = loc.coords;
         setLocation(coords);
       }
 
-      // 3. Send
       setStatus('sending');
       setStatusMsg('📡 正在发送...');
       await sendReport(picture.uri, coords);
@@ -114,7 +123,7 @@ export default function App() {
       const successMsg = isAutoBurst ? '✅ 已发送（自动模式）' : '✅ 已成功发送！';
       setStatusMsg(successMsg);
 
-      // ── Burst-mode detection ──────────────────────────────────────────────
+      // Burst-mode detection
       if (!isAutoBurst) {
         const now = Date.now();
         captureTimestamps.current = [
@@ -122,7 +131,6 @@ export default function App() {
           now,
         ];
         if (captureTimestamps.current.length >= 3) {
-          // 3 captures within 7 seconds → start auto burst
           startAutoBurst(handleShutter);
         }
       }
@@ -133,15 +141,12 @@ export default function App() {
     } finally {
       isProcessing.current = false;
     }
-  }, []);
+  }, [isAutoBurst]);
 
-  // ── Burst-mode helpers ──────────────────────────────────────────────────────
   const startAutoBurst = useCallback((shutterFn) => {
     setIsAutoBurst(true);
     setStatusMsg('🔴 自动连拍模式（每3秒）');
-    burstIntervalRef.current = setInterval(() => {
-      shutterFn();
-    }, 3000);
+    burstIntervalRef.current = setInterval(() => { shutterFn(); }, 3000);
   }, []);
 
   const stopAutoBurst = useCallback(() => {
@@ -154,14 +159,11 @@ export default function App() {
     setStatusMsg('📷 准备拍照...');
     captureTimestamps.current = [];
   }, []);
-  // ───────────────────────────────────────────────────────────────────────────
 
-  // Auto-shutter when app launches (as soon as camera is ready)
   const didAutoShutter = useRef(false);
   const onCameraReady = useCallback(() => {
     if (!didAutoShutter.current) {
       didAutoShutter.current = true;
-      // Small delay so camera sensor stabilises before capture
       setTimeout(() => handleShutter(), 1500);
     }
   }, [handleShutter]);
@@ -171,8 +173,7 @@ export default function App() {
     sending: '#FF9500', success: '#34C759', error: '#FF3B30',
   }[status] ?? '#8E8E93';
 
-  const burstColor = '#FF3B30'; // red banner for auto mode
-  const activeBannerColor = isAutoBurst ? burstColor : statusColor;
+  const activeBannerColor = isAutoBurst ? '#FF3B30' : statusColor;
   const isWorking = ['capturing', 'locating', 'sending'].includes(status);
 
   if (!camPermission) return <View style={styles.center}><ActivityIndicator size="large" /></View>;
@@ -191,7 +192,9 @@ export default function App() {
 
       {/* Status banner */}
       <View style={[styles.statusBanner, { borderColor: activeBannerColor }]}>
-        {(isWorking || isAutoBurst) && <ActivityIndicator size="small" color={activeBannerColor} style={{ marginRight: 8 }} />}
+        {(isWorking || isAutoBurst) && (
+          <ActivityIndicator size="small" color={activeBannerColor} style={{ marginRight: 8 }} />
+        )}
         <Text style={[styles.statusText, { color: activeBannerColor }]}>{statusMsg}</Text>
       </View>
 
@@ -202,35 +205,83 @@ export default function App() {
         </TouchableOpacity>
       )}
 
-      {/* Camera preview — always visible so cameraRef stays valid */}
-      <View style={styles.cameraContainer}>
+      {/* ── Main viewport: camera / map / photo ─────────────────────────── */}
+      <View style={styles.viewportContainer}>
+
+        {/* Camera — always mounted but hidden when not active */}
         <CameraView
           ref={cameraRef}
-          style={styles.cameraView}
+          style={[styles.fill, viewMode !== 'camera' && styles.hidden]}
           facing="back"
           onCameraReady={onCameraReady}
         />
+
+        {/* Google Maps */}
+        {viewMode === 'map' && location && (
+          <WebView
+            style={styles.fill}
+            source={{ html: buildMapHtml(location.latitude, location.longitude) }}
+            startInLoadingState
+            renderLoading={() => (
+              <View style={styles.loadingOverlay}>
+                <ActivityIndicator size="large" color="#007AFF" />
+                <Text style={styles.loadingText}>正在加载地图...</Text>
+              </View>
+            )}
+          />
+        )}
+
+        {/* Full-size captured photo */}
+        {viewMode === 'photo' && photo && (
+          <Image source={{ uri: photo }} style={styles.fill} resizeMode="contain" />
+        )}
+
+        {/* Back button when not in camera mode */}
+        {viewMode !== 'camera' && (
+          <TouchableOpacity style={styles.backBtn} onPress={() => setViewMode('camera')}>
+            <Text style={styles.backBtnText}>← 返回相机</Text>
+          </TouchableOpacity>
+        )}
+      </View>
+      {/* ─────────────────────────────────────────────────────────────────── */}
+
+      {/* Info row: thumbnail + location — both tappable */}
+      <View style={styles.infoRow}>
+
+        {/* Thumbnail — tap to see full photo */}
+        <TouchableOpacity
+          style={styles.thumbnailBtn}
+          onPress={() => photo && setViewMode('photo')}
+          disabled={!photo}
+        >
+          {photo
+            ? <Image source={{ uri: photo }} style={styles.thumbnail} />
+            : <View style={styles.thumbnailPlaceholder}>
+                <Text style={styles.placeholderText}>无照片</Text>
+              </View>
+          }
+          {photo && <Text style={styles.thumbnailCaption}>最近照片</Text>}
+        </TouchableOpacity>
+
+        {/* Location — tap to see map */}
+        <TouchableOpacity
+          style={styles.locationBtn}
+          onPress={() => location && setViewMode('map')}
+          disabled={!location}
+        >
+          <Text style={styles.locationLabel}>📍 位置</Text>
+          {location
+            ? <>
+                <Text style={styles.locationCoord}>{location.latitude.toFixed(5)}</Text>
+                <Text style={styles.locationCoord}>{location.longitude.toFixed(5)}</Text>
+                <Text style={styles.locationHint}>点击查看地图</Text>
+              </>
+            : <Text style={styles.locationCoord}>未获取</Text>
+          }
+        </TouchableOpacity>
       </View>
 
-      {/* Show last captured photo as thumbnail */}
-      {photo && (
-        <View style={styles.thumbnailContainer}>
-          <Text style={styles.thumbnailLabel}>最近照片：</Text>
-          <Image source={{ uri: photo }} style={styles.thumbnail} />
-        </View>
-      )}
-
-      {/* Location display */}
-      {location && (
-        <View style={styles.infoContainer}>
-          <Text style={styles.label}>位置：</Text>
-          <Text style={styles.valueText}>
-            {location.latitude.toFixed(6)}, {location.longitude.toFixed(6)}
-          </Text>
-        </View>
-      )}
-
-      {/* Shutter button — manual trigger */}
+      {/* Shutter button */}
       <TouchableOpacity
         style={[styles.shutterBtn, isWorking && styles.shutterBtnDisabled]}
         onPress={handleShutter}
@@ -239,8 +290,8 @@ export default function App() {
         {isWorking
           ? <ActivityIndicator size="small" color="#fff" />
           : <Text style={styles.shutterText}>
-            {status === 'success' || status === 'error' ? '🔄 再次拍照发送' : '📷 拍照并发送'}
-          </Text>
+              {status === 'success' || status === 'error' ? '🔄 再次拍照发送' : '📷 拍照并发送'}
+            </Text>
         }
       </TouchableOpacity>
 
@@ -250,44 +301,58 @@ export default function App() {
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#1C1C1E', padding: 16, alignItems: 'center', justifyContent: 'center' },
+  container: { flex: 1, backgroundColor: '#1C1C1E', padding: 12, paddingBottom: 28, alignItems: 'center' },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: '#1C1C1E' },
   title: { fontSize: 14, fontWeight: '700', color: '#FFF', marginBottom: 8, marginTop: 28 },
   statusBanner: {
     flexDirection: 'row', alignItems: 'center', width: '100%',
-    padding: 12, borderRadius: 12, borderWidth: 1.5, backgroundColor: '#2C2C2E', marginBottom: 12,
+    padding: 10, borderRadius: 10, borderWidth: 1.5, backgroundColor: '#2C2C2E', marginBottom: 8,
   },
   statusText: { fontSize: 12, fontWeight: '600', flexShrink: 1 },
-  cameraContainer: {
-    width: '100%', flex: 1, borderRadius: 16,
-    overflow: 'hidden', marginBottom: 10, backgroundColor: '#000',
+  stopBtn: {
+    width: '100%', backgroundColor: '#FF3B30', paddingVertical: 10,
+    borderRadius: 10, alignItems: 'center', marginBottom: 8,
   },
-  cameraView: { flex: 1 },
-  thumbnailContainer: {
-    width: '100%', flexDirection: 'row', alignItems: 'center',
-    backgroundColor: '#2C2C2E', borderRadius: 12, padding: 8, marginBottom: 12,
+  stopBtnText: { color: '#FFF', fontSize: 13, fontWeight: '700' },
+
+  // Main viewport
+  viewportContainer: { width: '100%', flex: 1, borderRadius: 16, overflow: 'hidden', backgroundColor: '#000', marginBottom: 10 },
+  fill: { ...StyleSheet.absoluteFillObject },
+  hidden: { opacity: 0 },
+  loadingOverlay: { ...StyleSheet.absoluteFillObject, alignItems: 'center', justifyContent: 'center', backgroundColor: '#1C1C1E' },
+  loadingText: { color: '#FFF', marginTop: 12, fontSize: 13 },
+  backBtn: {
+    position: 'absolute', top: 12, left: 12,
+    backgroundColor: 'rgba(0,0,0,0.55)', paddingHorizontal: 14, paddingVertical: 7, borderRadius: 20,
   },
-  thumbnailLabel: { color: '#EBEBF5', fontSize: 13, marginRight: 8 },
-  thumbnail: { width: 64, height: 64, borderRadius: 8 },
-  infoContainer: {
-    width: '100%', padding: 12, backgroundColor: '#2C2C2E', borderRadius: 12,
-    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12,
+  backBtnText: { color: '#FFF', fontSize: 13, fontWeight: '600' },
+
+  // Info row
+  infoRow: { flexDirection: 'row', width: '100%', marginBottom: 10, gap: 8 },
+  thumbnailBtn: { flex: 1, alignItems: 'center', backgroundColor: '#2C2C2E', borderRadius: 10, padding: 8 },
+  thumbnail: { width: 64, height: 64, borderRadius: 10 },
+  thumbnailPlaceholder: {
+    width: 64, height: 64, borderRadius: 10, backgroundColor: '#3A3A3C',
+    alignItems: 'center', justifyContent: 'center',
   },
-  label: { fontSize: 14, fontWeight: '600', color: '#EBEBF5' },
-  valueText: { fontSize: 13, color: '#EBEBF5', textAlign: 'right' },
+  thumbnailCaption: { color: '#EBEBF5', fontSize: 10, marginTop: 3 },
+  placeholderText: { color: '#8E8E93', fontSize: 10 },
+  locationBtn: {
+    flex: 1, backgroundColor: '#2C2C2E', borderRadius: 10, padding: 10,
+    justifyContent: 'center',
+  },
+  locationLabel: { color: '#EBEBF5', fontSize: 12, fontWeight: '700', marginBottom: 2 },
+  locationCoord: { color: '#8E8E93', fontSize: 12 },
+  locationHint: { color: '#007AFF', fontSize: 10, marginTop: 3 },
+
+  // Shutter
   shutterBtn: {
-    width: '100%', backgroundColor: '#FF3B30', paddingVertical: 18,
-    borderRadius: 16, alignItems: 'center', elevation: 4,
+    width: '100%', backgroundColor: '#FF3B30', paddingVertical: 16,
+    borderRadius: 14, alignItems: 'center', elevation: 4,
   },
   shutterBtnDisabled: { backgroundColor: '#555', elevation: 0 },
   shutterText: { color: '#FFF', fontSize: 17, fontWeight: '700' },
-  stopBtn: {
-    width: '100%', backgroundColor: '#FF3B30', paddingVertical: 12,
-    borderRadius: 12, alignItems: 'center', marginBottom: 8,
-  },
-  stopBtnText: { color: '#FFF', fontSize: 15, fontWeight: '700' },
   permText: { color: '#FFF', fontSize: 16, marginBottom: 16 },
   permBtn: { backgroundColor: '#007AFF', paddingHorizontal: 24, paddingVertical: 12, borderRadius: 10 },
   permBtnText: { color: '#FFF', fontWeight: '600' },
 });
-
